@@ -214,7 +214,7 @@ class Tracker:
         return None
 
     async def _maybe_threshold_alert(self, route: Route, result) -> None:
-        if result.price >= route.threshold:
+        if not route.has_target or result.price >= route.threshold:
             return
         if await self.db.already_notified(route.id, result.price, "threshold"):
             log.info("#%s eşik zaten bildirildi (≤ %.0f).", route.id, result.price)
@@ -228,10 +228,12 @@ class Tracker:
         log.info("#%s EŞİK bildirimi: %.0f < %.0f", route.id, result.price, route.threshold)
 
     async def _maybe_drop_alert(self, route: Route, result, previous) -> None:
-        if self.drop_alert_pct <= 0 or not previous or previous <= 0:
+        # Rota kendi yüzdesini taşıyorsa onu, yoksa global ayarı kullan.
+        effective_pct = route.drop_pct if route.drop_pct and route.drop_pct > 0 else self.drop_alert_pct
+        if effective_pct <= 0 or not previous or previous <= 0:
             return
         pct = (previous - result.price) / previous * 100.0
-        if pct < self.drop_alert_pct:
+        if pct < effective_pct:
             return
         if await self.db.already_notified(route.id, result.price, "drop"):
             log.info("#%s düşüş zaten bildirildi (≤ %.0f).", route.id, result.price)

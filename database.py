@@ -68,7 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_notif_route  ON notifications(route_id);
 
 _ROUTE_COLS = ("id, chat_id, origin, dest, date, threshold, currency, active, "
                "return_date, passengers, cabin, flex_days, pos, date_end, return_date_end, "
-               "nights, direct_only")
+               "nights, direct_only, drop_pct")
 
 
 @dataclass
@@ -104,6 +104,7 @@ class Database:
         await self._add_column_if_missing(db, "routes", "return_date_end", "TEXT")
         await self._add_column_if_missing(db, "routes", "nights", "INTEGER NOT NULL DEFAULT 0")
         await self._add_column_if_missing(db, "routes", "direct_only", "INTEGER NOT NULL DEFAULT 0")
+        await self._add_column_if_missing(db, "routes", "drop_pct", "REAL NOT NULL DEFAULT 0")
         await self._add_column_if_missing(
             db, "notifications", "kind", "TEXT NOT NULL DEFAULT 'threshold'"
         )
@@ -122,13 +123,13 @@ class Database:
             cur = await db.execute(
                 "INSERT INTO routes "
                 "(chat_id, origin, dest, date, threshold, currency, active, return_date, "
-                "passengers, cabin, flex_days, pos, date_end, return_date_end, nights, direct_only) "
-                "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "passengers, cabin, flex_days, pos, date_end, return_date_end, nights, direct_only, drop_pct) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (route.chat_id, route.origin, route.dest, route.date,
                  route.threshold, route.currency, route.return_date,
                  route.passengers, route.cabin, route.flex_days, route.pos,
                  route.date_end, route.return_date_end, route.nights,
-                 1 if route.direct_only else 0),
+                 1 if route.direct_only else 0, route.drop_pct),
             )
             await db.commit()
             return cur.lastrowid
@@ -311,4 +312,5 @@ class Database:
             return_date_end=r["return_date_end"],
             nights=r["nights"],
             direct_only=bool(r["direct_only"]),
+            drop_pct=r["drop_pct"],
         )

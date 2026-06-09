@@ -18,7 +18,7 @@ def test_parse_flags_defaults():
     pos, flags = parse_flags(["IST", "LON", "15-08-2026", "3000"])
     assert pos == ["IST", "LON", "15-08-2026", "3000"]
     assert flags == {"pax": 1, "cabin": "economy", "flex": 0, "nights": 0, "pos": None,
-                     "near": False, "direct": False, "error": None}
+                     "near": False, "direct": False, "drop": 0.0, "error": None}
 
 
 def test_parse_flags_pos():
@@ -338,3 +338,54 @@ def test_notifier_shows_stops():
     r = Route(3, 1, "IST", "BEG", "2026-08-15", 3000)
     text = Notifier._format(r, FlightResult(price=2500, stops="1 aktarma", link="x"))
     assert "Aktarma: 1 aktarma" in text
+
+
+# -------------------------------------------------- hedefsiz / ani düşüş
+def test_has_target():
+    assert Route(1, 1, "IST", "BEG", "2026-08-15", 3000).has_target is True
+    assert Route(1, 1, "IST", "BEG", "2026-08-15", 0).has_target is False
+
+
+def test_parse_flags_drop():
+    _, flags = parse_flags(["x", "drop=10"])
+    assert flags["drop"] == 10.0 and flags["error"] is None
+    _, bad = parse_flags(["x", "drop=200"])
+    assert bad["error"] is not None
+
+
+async def test_no_target_drop_only_route(db):
+    rid = await db.add_route(Route(None, 1, "IST", "BEG", "2026-08-15", 0, drop_pct=10))
+    r = await db.get_route(rid, 1)
+    assert r.has_target is False and r.drop_pct == 10
+
+
+async def test_no_target_route_alerts_only_on_drop():
+    """threshold=0 → eşik bildirimi yok; %drop'u aşan düşüşte drop bildirimi var."""
+    import asyncio, os, tempfile
+    from notifier import Notifier
+    from models import FlightResult
+    from tracker import Tracker
+
+    class FakeBot:
+        def __init__(self): self.sent = []
+        async def send_message(self, chat_id, text, **kw): self.sent.append(text)
+
+    class Scr:
+        def __init__(self, prices): self.p = list(prices); self.i = 0
+        async def fetch_cheapest(self, o, d, date, return_date=None, passengers=1,
+                                 cabin="economy", nonstop_only=False):
+            v = self.p[self.i]; self.i += 1
+            return FlightResult(price=v, link="x")
+
+    database = Database(os.path.join(tempfile.mkdtemp(), "t.db"))
+    await database.init()
+    rid = await database.add_route(Route(None, 9, "IST", "BEG", "2026-08-15", 0, drop_pct=10))
+    bot = FakeBot()
+    notifier = Notifier(bot, min_interval=0)
+    # global drop kapalı (0); rota kendi %10'unu kullanmalı
+    tracker = Tracker(database, Scr([5000, 5000, 4200]), notifier, 0, 0, {}, drop_alert_pct=0)
+    for _ in range(3):
+        await tracker.run_scan(); await asyncio.sleep(0.02)
+    await notifier.drain()
+    # 5000→5000 (düşüş yok), 5000→4200 = %16 ≥ %10 → 1 drop bildirimi
+    assert len(bot.sent) == 1 and "düşüş" in bot.sent[0].lower()

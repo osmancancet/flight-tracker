@@ -160,7 +160,7 @@ class Notifier:
         dl = cls._chosen_date_line(route, r)
         if dl:
             lines.append(dl)
-        if r.price >= route.threshold:
+        if route.has_target and r.price >= route.threshold:
             lines.append(f"ℹ️ Hedefin ({route.threshold:.0f}) hâlâ üstünde ama hızlı düşüyor.")
         if r.airline:
             lines.append(f"🏷️ Havayolu: {r.airline}")

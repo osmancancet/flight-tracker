@@ -148,7 +148,18 @@ def parse_flags(args: List[str]):
             raw[k.strip().lower()] = v.strip()
 
     flags = {"pax": 1, "cabin": "economy", "flex": 0, "nights": 0, "pos": None,
-             "near": False, "direct": False, "error": None}
+             "near": False, "direct": False, "drop": 0.0, "error": None}
+
+    if "drop" in raw or "dusus" in raw or "düşüş" in raw:
+        val = raw.get("drop") or raw.get("dusus") or raw.get("düşüş") or ""
+        try:
+            d = float(val)
+            if 1 <= d <= 90:
+                flags["drop"] = d
+            else:
+                flags["error"] = "Düşüş yüzdesi 1-90 olmalı (drop=10)."
+        except ValueError:
+            flags["error"] = "Düşüş yüzdesi sayı olmalı (drop=10)."
 
     if "nights" in raw or "gece" in raw:
         val = raw.get("nights", raw.get("gece"))
@@ -250,7 +261,7 @@ def _sparkline(prices: List[float]) -> str:
 # ====================== BUTON SİHİRBAZI (komut yazmadan rota ekleme) ======================
 # Konuşma durumları
 (W_ORIGIN, W_DEST, W_DEST_CUSTOM, W_TRIP, W_DEPM, W_DEP_CUSTOM,
- W_RETMODE, W_NIGHTS, W_RETM, W_RET_CUSTOM, W_PRICE, W_PRICE_CUSTOM, W_OPTS) = range(13)
+ W_RETMODE, W_NIGHTS, W_RETM, W_RET_CUSTOM, W_PRICE, W_PRICE_CUSTOM, W_DROP, W_OPTS) = range(14)
 
 # Kalkış şehirleri (token → (etiket, gerçek havalimanı kodları))
 WIZ_ORIGINS = [
@@ -262,6 +273,7 @@ WIZ_ORIGINS = [
 WIZ_DESTS = [("BEG", "Belgrad 🇷🇸"), ("BALKAN", "Tüm Balkan 🌍")]
 WIZ_NIGHTS = [3, 5, 7, 10, 14]
 WIZ_PRICES = [3000, 4000, 5000, 7000]
+WIZ_DROPS = [5, 10, 15, 20]
 _TR_MONTHS = ["", "Oca", "Şub", "Mar", "Nis", "May", "Haz",
               "Tem", "Ağu", "Eyl", "Eki", "Kas", "Ara"]
 
@@ -329,7 +341,9 @@ class BotHandlers:
         rows: List[List[InlineKeyboardButton]] = []
         for r in routes:
             badge = "🟢" if r.active else "⏸️"
-            lines.append(f"{badge} #{r.id} — <b>{r.label()}</b>  ≤ {r.threshold:.0f} {r.currency}")
+            hedef = (f"≤ {r.threshold:.0f} {r.currency}" if r.has_target
+                     else f"📉 %{r.drop_pct:.0f} düşüşte")
+            lines.append(f"{badge} #{r.id} — <b>{r.label()}</b>  {hedef}")
             toggle = (InlineKeyboardButton("⏸️ Duraklat", callback_data=f"pause:{r.id}")
                       if r.active else
                       InlineKeyboardButton("▶️ Devam", callback_data=f"resume:{r.id}"))
@@ -403,9 +417,16 @@ class BotHandlers:
                 await self._reply(update, "❌ Dönüş tarihi gidişten önce olamaz.")
                 return
 
-            threshold = _parse_price(price_raw)
-            if threshold is None:
-                await self._reply(update, "❌ Hedef fiyat pozitif bir sayı olmalı (örn. 3000).")
+            if price_raw.lower() in ("yok", "-"):
+                threshold = 0.0  # hedef yok → sadece düşüş bildirimi
+            else:
+                threshold = _parse_price(price_raw)
+                if threshold is None:
+                    await self._reply(update, "❌ Hedef fiyat pozitif bir sayı olmalı (örn. 3000) "
+                                      "ya da 'yok' yazıp drop=10 ile düşüş takibi seç.")
+                    return
+            if threshold == 0 and flags["drop"] <= 0:
+                await self._reply(update, "❌ Hedef 'yok' ise düşüş yüzdesi gerekli: drop=10")
                 return
 
             chat_id = update.effective_chat.id
@@ -413,7 +434,7 @@ class BotHandlers:
                           return_date=ret_start, date_end=dep_end, return_date_end=ret_end,
                           passengers=flags["pax"], cabin=flags["cabin"],
                           flex_days=flags["flex"], nights=flags["nights"], pos=flags["pos"],
-                          direct_only=flags["direct"])
+                          direct_only=flags["direct"], drop_pct=flags["drop"])
             rid = await self.db.add_route(route)
             route.id = rid
             await self._reply(
@@ -497,10 +518,11 @@ class BotHandlers:
             await self._reply(
                 update,
                 f"📈 <b>{route.label()}</b>  (#{route.id})\n"
-                f"Hedef: {route.threshold:.0f} {route.currency}\n\n"
-                f"Güncel : <b>{stats.latest:.0f}</b> {route.currency}  ({trend})\n"
-                f"En ucuz: {stats.minimum:.0f}   En pahalı: {stats.maximum:.0f}\n"
-                f"Ortalama: {stats.average:.0f}   Ölçüm: {stats.count}\n"
+                + (f"Hedef: {route.threshold:.0f} {route.currency}\n\n" if route.has_target
+                   else f"Hedef yok — %{route.drop_pct:.0f} düşüşte bildir\n\n")
+                + f"Güncel : <b>{stats.latest:.0f}</b> {route.currency}  ({trend})\n"
+                + f"En ucuz: {stats.minimum:.0f}   En pahalı: {stats.maximum:.0f}\n"
+                + f"Ortalama: {stats.average:.0f}   Ölçüm: {stats.count}\n"
                 + (f"\n<code>{spark}</code>" if spark else "")
                 + (f"\n\n{sig}" if sig else ""),
             )
@@ -858,11 +880,27 @@ class BotHandlers:
         if row:
             rows.append(row)
         rows.append([InlineKeyboardButton("✍️ Kendim yaz", callback_data="p:custom")])
+        rows.append([InlineKeyboardButton("🔔 Hedef yok — düşünce bildir", callback_data="p:none")])
         rows.append(self._cancel_row())
-        await self._wiz_render(update, "💰 <b>Hedef fiyat?</b>\nBu fiyatın altına düşünce haber veririm:", rows)
+        await self._wiz_render(update, "💰 <b>Hedef fiyat?</b>\nBu fiyatın altına düşünce haber "
+                               "veririm. Ya da hedef koymadan, fiyat <b>ani düştüğünde</b> bildirebilirim:", rows)
 
     async def wiz_price(self, update, ctx) -> int:
         ctx.user_data["wiz"]["threshold"] = float(update.callback_query.data.split(":")[1])
+        ctx.user_data["wiz"]["drop_pct"] = 0.0
+        await self._wiz_show_opts(update, ctx)
+        return W_OPTS
+
+    async def wiz_price_none(self, update, ctx) -> int:
+        ctx.user_data["wiz"]["threshold"] = 0.0  # hedef yok
+        rows = [[InlineKeyboardButton(f"%{d} düşünce", callback_data=f"dr:{d}")] for d in WIZ_DROPS]
+        rows.append(self._cancel_row())
+        await self._wiz_render(update, "📉 <b>Ne kadar düşünce haber vereyim?</b>\n"
+                               "Bir önceki kontrole göre fiyat bu oranda düşerse bildiririm:", rows)
+        return W_DROP
+
+    async def wiz_drop(self, update, ctx) -> int:
+        ctx.user_data["wiz"]["drop_pct"] = float(update.callback_query.data.split(":")[1])
         await self._wiz_show_opts(update, ctx)
         return W_OPTS
 
@@ -877,6 +915,7 @@ class BotHandlers:
             await update.effective_message.reply_text("❌ Geçerli bir sayı yaz (örn. 5500):")
             return W_PRICE_CUSTOM
         ctx.user_data["wiz"]["threshold"] = val
+        ctx.user_data["wiz"]["drop_pct"] = 0.0
         await self._wiz_show_opts(update, ctx)
         return W_OPTS
 
@@ -890,10 +929,10 @@ class BotHandlers:
                     origins.append(c)
         return Route(
             None, chat_id, ",".join(origins), ",".join(wiz["dests"]),
-            wiz["dep_start"], wiz["threshold"], "TRY",
+            wiz["dep_start"], wiz.get("threshold", 0.0), "TRY",
             return_date=wiz.get("ret_start"), date_end=wiz.get("dep_end"),
             return_date_end=wiz.get("ret_end"), nights=wiz.get("nights", 0),
-            direct_only=wiz.get("direct", False),
+            direct_only=wiz.get("direct", False), drop_pct=wiz.get("drop_pct", 0.0),
         )
 
     async def _wiz_show_opts(self, update, ctx) -> None:
@@ -905,9 +944,13 @@ class BotHandlers:
             [InlineKeyboardButton("✅ Kaydet", callback_data="opt:save")],
             self._cancel_row(),
         ]
+        if route.has_target:
+            hedef = f"Hedef: <b>{route.threshold:.0f} TL</b>"
+        else:
+            hedef = f"Hedef yok — fiyat <b>%{route.drop_pct:.0f}</b> düşünce bildir"
         await self._wiz_render(
             update,
-            f"📝 <b>Özet</b>\n<b>{route.label()}</b>\nHedef: <b>{route.threshold:.0f} TL</b>\n\n"
+            f"📝 <b>Özet</b>\n<b>{route.label()}</b>\n{hedef}\n\n"
             "Aktarma tercihini seç ve kaydet:",
             rows,
         )
@@ -922,12 +965,12 @@ class BotHandlers:
             wiz = ctx.user_data.get("wiz", {})
             route = self._wiz_build_route(wiz, update.effective_chat.id)
             rid = await self.db.add_route(route)
+            hedef = (f"Hedef: <b>{route.threshold:.0f} TL</b>" if route.has_target
+                     else f"Hedef yok — fiyat <b>%{route.drop_pct:.0f}</b> düşünce bildiririm")
             await update.callback_query.answer("Kaydedildi ✅")
             await update.callback_query.edit_message_text(
-                f"✅ Rota eklendi (#{rid}):\n<b>{route.label()}</b>\n"
-                f"Hedef: <b>{route.threshold:.0f} TL</b>\n\n"
-                "Her 10 dakikada bir tarayıp ucuzlayınca haber vereceğim. "
-                "Rotaların için /rotalar yaz.",
+                f"✅ Rota eklendi (#{rid}):\n<b>{route.label()}</b>\n{hedef}\n\n"
+                "Her 10 dakikada bir tarayacağım. Rotaların için /rotalar yaz.",
                 parse_mode=ParseMode.HTML, disable_web_page_preview=True,
             )
         except Exception as exc:  # noqa: BLE001
@@ -976,8 +1019,10 @@ class BotHandlers:
                 W_PRICE: [
                     CallbackQueryHandler(self.wiz_price, pattern=r"^p:\d+$"),
                     CallbackQueryHandler(self.wiz_price_custom_ask, pattern="^p:custom$"),
+                    CallbackQueryHandler(self.wiz_price_none, pattern="^p:none$"),
                 ],
                 W_PRICE_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.wiz_price_custom)],
+                W_DROP: [CallbackQueryHandler(self.wiz_drop, pattern=r"^dr:\d+$")],
                 W_OPTS: [
                     CallbackQueryHandler(self.wiz_opt_toggle, pattern="^opt:direct$"),
                     CallbackQueryHandler(self.wiz_save, pattern="^opt:save$"),

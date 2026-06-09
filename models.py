@@ -90,7 +90,7 @@ class Route:
     origin: str            # IATA veya virgüllü liste, örn. "IST" / "IST,SAW"
     dest: str              # IATA veya virgüllü liste, örn. "BEG"
     date: str              # gidiş, ISO biçim "YYYY-MM-DD"
-    threshold: float       # bu fiyatın altına düşünce bildirim at
+    threshold: float       # bu fiyatın altına düşünce bildir; 0 = hedef yok (sadece düşüş)
     currency: str = "TRY"
     active: bool = True
     return_date: Optional[str] = None  # dolu ise gidiş-dönüş (dönüş aralığının başı), ISO
@@ -101,7 +101,12 @@ class Route:
     flex_days: int = 0                 # ±gün esnek tarih penceresi (0 = kapalı)
     nights: int = 0                    # sabit süre: dönüş = gidiş + nights gece (0 = kapalı)
     direct_only: bool = False          # True ise yalnızca aktarmasız uçuşlar dikkate alınır
+    drop_pct: float = 0.0              # rota-bazı ani düşüş %; 0 = global ayarı kullan
     pos: Optional[str] = None          # virgüllü POS kodları, örn "GB,DE" (bildirimde karşılaştır)
+
+    @property
+    def has_target(self) -> bool:
+        return self.threshold is not None and self.threshold > 0
 
     def pos_codes(self) -> list:
         return [c for c in (self.pos or "").split(",") if c] if self.pos else []
