@@ -5,6 +5,8 @@ Hedef fiyatın altına düşen uçak biletlerini 7/24 arka planda takip eden, Te
 Playwright ile çekilir; rotalar dinamik olarak Telegram komutlarıyla yönetilir.
 
 ## Özellikler
+- 🧭 **Buton sihirbazı** — `/menu` ile komut yazmadan, adım adım butonlarla rota ekle
+  (kalkış → varış → yön → ay/tarih → gece → fiyat → kaydet).
 - 🤖 **Telegram ile kontrol** — rotaları komutla ekle/sil/listele/duraklat, inline butonlarla yönet.
 - ✈️ **Tek yön & gidiş-dönüş** — dönüş tarihi opsiyonel.
 - 👥 **Çoklu yolcu & kabin** — `pax=2 cabin=business` bayraklarıyla yolcu sayısı ve kabin sınıfı.

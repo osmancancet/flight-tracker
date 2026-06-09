@@ -17,6 +17,7 @@ CallbackQueryHandler bunları işler. Tüm handler'lar geniş try-except ile sar
 """
 from __future__ import annotations
 
+import calendar
 from datetime import datetime
 from typing import List, Optional, Tuple
 
@@ -27,6 +28,9 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
 )
 
 import asyncio
@@ -53,6 +57,8 @@ _SPARK = "▁▂▃▄▅▆▇█"
 HELP_TEXT = (
     "🛫 <b>Ucuz Uçak Bileti Avcısı</b>\n\n"
     "Hedef fiyatın altına düşen biletleri 7/24 takip eder.\n\n"
+    "👉 <b>Kolay yol:</b> /menu yaz ve butonlarla ekle (komut yazmana gerek yok).\n"
+    "Aşağıdakiler ileri seviye yazılı komutlardır.\n\n"
     "<b>Rota ekleme</b>\n"
     "• <code>/rota_ekle IST BEG 15-08-2026 3000</code>  (tek yön)\n"
     "• <code>/rota_ekle IST,SAW,ADB,ESB BEG 15-08-2026 3000</code>  (çoklu kalkış)\n"
@@ -241,13 +247,55 @@ def _sparkline(prices: List[float]) -> str:
                     for p in prices)
 
 
+# ====================== BUTON SİHİRBAZI (komut yazmadan rota ekleme) ======================
+# Konuşma durumları
+(W_ORIGIN, W_DEST, W_DEST_CUSTOM, W_TRIP, W_DEPM, W_DEP_CUSTOM,
+ W_RETMODE, W_NIGHTS, W_RETM, W_RET_CUSTOM, W_PRICE, W_PRICE_CUSTOM, W_OPTS) = range(13)
+
+# Kalkış şehirleri (token → (etiket, gerçek havalimanı kodları))
+WIZ_ORIGINS = [
+    ("IST", "İstanbul", ["IST", "SAW"]),
+    ("ADB", "İzmir", ["ADB"]),
+    ("ESB", "Ankara", ["ESB"]),
+    ("AYT", "Antalya", ["AYT"]),
+]
+WIZ_DESTS = [("BEG", "Belgrad 🇷🇸"), ("BALKAN", "Tüm Balkan 🌍")]
+WIZ_NIGHTS = [3, 5, 7, 10, 14]
+WIZ_PRICES = [3000, 4000, 5000, 7000]
+_TR_MONTHS = ["", "Oca", "Şub", "Mar", "Nis", "May", "Haz",
+              "Tem", "Ağu", "Eyl", "Eki", "Kas", "Ara"]
+
+
+def _month_options(n: int = 6) -> List[Tuple[str, str]]:
+    """Bugünden itibaren n ay için (etiket, 'YYYY-MM') listesi."""
+    now = datetime.now()
+    out = []
+    y, m = now.year, now.month
+    for _ in range(n):
+        out.append((f"{_TR_MONTHS[m]} {y}", f"{y}-{m:02d}"))
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+    return out
+
+
+def _month_range(ym: str) -> Tuple[str, str]:
+    """'YYYY-MM' → (ilk_gün_iso, son_gün_iso)."""
+    y, m = (int(x) for x in ym.split("-"))
+    last = calendar.monthrange(y, m)[1]
+    return f"{y}-{m:02d}-01", f"{y}-{m:02d}-{last:02d}"
+
+
 class BotHandlers:
     def __init__(self, db: Database, scraper=None):
         self.db = db
         self.scraper = scraper  # /karsilastir için (opsiyonel; yoksa komut bilgi verir)
 
     def register(self, app: Application) -> None:
-        app.add_handler(CommandHandler(["start", "yardim", "help"], self.cmd_help))
+        # Sihirbaz (buton akışı) ÖNCE — entry callback'lerini yakalasın.
+        app.add_handler(self._build_wizard())
+        app.add_handler(CommandHandler(["start", "menu"], self.cmd_start))
+        app.add_handler(CommandHandler(["yardim", "help"], self.cmd_help))
         app.add_handler(CommandHandler("rota_ekle", self.cmd_add))
         app.add_handler(CommandHandler("rotalar", self.cmd_list))
         app.add_handler(CommandHandler("sil", self.cmd_delete))
@@ -258,7 +306,10 @@ class BotHandlers:
         app.add_handler(CommandHandler("grafik", self.cmd_chart))
         app.add_handler(CommandHandler(["karsilastir", "pos"], self.cmd_compare))
         app.add_handler(CommandHandler("durum", self.cmd_status))
-        app.add_handler(CallbackQueryHandler(self.on_callback))
+        # Menü butonları (sihirbaz dışı): list/help. (menu:new sihirbaz girişidir.)
+        app.add_handler(CallbackQueryHandler(self.on_menu, pattern="^menu:(list|help)$"))
+        # Rota yönetim butonları
+        app.add_handler(CallbackQueryHandler(self.on_callback, pattern="^(del|pause|resume):"))
 
     # ------------------------------------------------------------- helpers
     async def _reply(self, update: Update, text: str,
@@ -605,3 +656,362 @@ class BotHandlers:
     async def _do_resume(self, chat_id: int, route_id: int) -> str:
         ok = await self.db.set_active(route_id, chat_id, True)
         return f"▶️ #{route_id} tekrar aktif." if ok else f"❓ #{route_id} bulunamadı."
+
+    # ===================== BUTON SİHİRBAZI =====================
+    @staticmethod
+    def _cancel_row():
+        return [InlineKeyboardButton("✖️ İptal", callback_data="wiz:cancel")]
+
+    async def _wiz_render(self, update: Update, text: str,
+                          rows: List[List[InlineKeyboardButton]]) -> None:
+        markup = InlineKeyboardMarkup(rows)
+        q = update.callback_query
+        if q:
+            await q.answer()
+            try:
+                await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup,
+                                          disable_web_page_preview=True)
+                return
+            except Exception:  # noqa: BLE001 (mesaj değişmemişse vb.)
+                pass
+        if update.effective_message:
+            await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML,
+                                                      reply_markup=markup,
+                                                      disable_web_page_preview=True)
+
+    # --- giriş ---
+    async def wiz_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        ctx.user_data["wiz"] = {"origins": [], "dests": [], "direct": False, "nights": 0}
+        await self._wiz_show_origin(update, ctx)
+        return W_ORIGIN
+
+    async def _wiz_show_origin(self, update, ctx) -> None:
+        sel = ctx.user_data["wiz"]["origins"]
+        rows = []
+        for tok, name, _ in WIZ_ORIGINS:
+            mark = "✅ " if tok in sel else ""
+            rows.append([InlineKeyboardButton(f"{mark}{name}", callback_data=f"o:{tok}")])
+        rows.append([InlineKeyboardButton("➡️ Devam", callback_data="o:done")])
+        rows.append(self._cancel_row())
+        await self._wiz_render(update, "✈️ <b>Nereden uçacaksın?</b>\nBirden çok seçebilirsin:", rows)
+
+    async def wiz_origin_toggle(self, update, ctx) -> int:
+        tok = update.callback_query.data.split(":")[1]
+        sel = ctx.user_data["wiz"]["origins"]
+        if tok in sel:
+            sel.remove(tok)
+        else:
+            sel.append(tok)
+        await self._wiz_show_origin(update, ctx)
+        return W_ORIGIN
+
+    async def wiz_origin_done(self, update, ctx) -> int:
+        if not ctx.user_data["wiz"]["origins"]:
+            await update.callback_query.answer("En az bir kalkış seç", show_alert=True)
+            return W_ORIGIN
+        await self._wiz_show_dest(update, ctx)
+        return W_DEST
+
+    # --- varış ---
+    async def _wiz_show_dest(self, update, ctx) -> None:
+        rows = [[InlineKeyboardButton(name, callback_data=f"d:{tok}")] for tok, name in WIZ_DESTS]
+        rows.append([InlineKeyboardButton("✍️ Başka (yaz)", callback_data="d:custom")])
+        rows.append(self._cancel_row())
+        await self._wiz_render(update, "🎯 <b>Nereye?</b>", rows)
+
+    async def wiz_dest(self, update, ctx) -> int:
+        tok = update.callback_query.data.split(":")[1]
+        ctx.user_data["wiz"]["dests"] = list(DEST_GROUPS["BALKAN"]) if tok == "BALKAN" else [tok]
+        await self._wiz_show_trip(update, ctx)
+        return W_TRIP
+
+    async def wiz_dest_custom_ask(self, update, ctx) -> int:
+        await self._wiz_render(update, "✍️ Varış havalimanı kodunu yaz (örn. <code>BEG</code> "
+                               "ya da <code>BEG,SJJ</code>):", [self._cancel_row()])
+        return W_DEST_CUSTOM
+
+    async def wiz_dest_custom(self, update, ctx) -> int:
+        codes, err = _parse_airports(update.effective_message.text.strip())
+        if err:
+            await update.effective_message.reply_text(f"❌ {err} Tekrar yaz:")
+            return W_DEST_CUSTOM
+        ctx.user_data["wiz"]["dests"] = codes
+        await self._wiz_show_trip(update, ctx)
+        return W_TRIP
+
+    # --- yön ---
+    async def _wiz_show_trip(self, update, ctx) -> None:
+        rows = [
+            [InlineKeyboardButton("➡️ Tek yön", callback_data="t:one")],
+            [InlineKeyboardButton("🔁 Gidiş-dönüş", callback_data="t:round")],
+            self._cancel_row(),
+        ]
+        await self._wiz_render(update, "🧭 <b>Tek yön mü, gidiş-dönüş mü?</b>", rows)
+
+    async def wiz_trip(self, update, ctx) -> int:
+        ctx.user_data["wiz"]["trip"] = update.callback_query.data.split(":")[1]
+        await self._wiz_show_depm(update, ctx)
+        return W_DEPM
+
+    # --- gidiş ay/tarih ---
+    async def _wiz_show_depm(self, update, ctx) -> None:
+        opts = _month_options(6)
+        rows, row = [], []
+        for label, ym in opts:
+            row.append(InlineKeyboardButton(label, callback_data=f"dm:{ym}"))
+            if len(row) == 3:
+                rows.append(row); row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("✍️ Belirli tarih / aralık", callback_data="dm:custom")])
+        rows.append(self._cancel_row())
+        await self._wiz_render(update, "📅 <b>Gidiş ne zaman?</b>\nBir ay seç (ay boyunca en ucuz "
+                               "gün taranır) ya da belirli tarih yaz:", rows)
+
+    async def wiz_depm(self, update, ctx) -> int:
+        ym = update.callback_query.data.split(":")[1]
+        start, end = _month_range(ym)
+        ctx.user_data["wiz"]["dep_start"], ctx.user_data["wiz"]["dep_end"] = start, end
+        return await self._wiz_after_dep(update, ctx)
+
+    async def wiz_dep_custom_ask(self, update, ctx) -> int:
+        await self._wiz_render(update, "✍️ Gidiş tarihini ya da aralığını yaz:\n"
+                               "<code>15-08-2026</code> veya <code>10-07-2026..15-07-2026</code>",
+                               [self._cancel_row()])
+        return W_DEP_CUSTOM
+
+    async def wiz_dep_custom(self, update, ctx) -> int:
+        s, e, err = _parse_date_range(update.effective_message.text.strip())
+        if err:
+            await update.effective_message.reply_text(f"❌ {err} Tekrar yaz:")
+            return W_DEP_CUSTOM
+        ctx.user_data["wiz"]["dep_start"], ctx.user_data["wiz"]["dep_end"] = s, e
+        return await self._wiz_after_dep(update, ctx)
+
+    async def _wiz_after_dep(self, update, ctx) -> int:
+        if ctx.user_data["wiz"]["trip"] == "round":
+            await self._wiz_show_retmode(update, ctx)
+            return W_RETMODE
+        await self._wiz_show_price(update, ctx)
+        return W_PRICE
+
+    # --- dönüş modu ---
+    async def _wiz_show_retmode(self, update, ctx) -> None:
+        rows = [
+            [InlineKeyboardButton("🌙 Sabit süre (kaç gece)", callback_data="rm:nights")],
+            [InlineKeyboardButton("📅 Dönüş ayı seç", callback_data="rm:month")],
+            [InlineKeyboardButton("✍️ Dönüş tarihi yaz", callback_data="rm:custom")],
+            self._cancel_row(),
+        ]
+        await self._wiz_render(update, "🔁 <b>Dönüşü nasıl belirleyelim?</b>", rows)
+
+    async def wiz_retmode(self, update, ctx) -> int:
+        mode = update.callback_query.data.split(":")[1]
+        if mode == "nights":
+            rows = [[InlineKeyboardButton(f"{n} gece", callback_data=f"n:{n}")] for n in WIZ_NIGHTS]
+            rows.append(self._cancel_row())
+            await self._wiz_render(update, "🌙 <b>Kaç gece kalacaksın?</b>", rows)
+            return W_NIGHTS
+        if mode == "month":
+            opts = _month_options(6)
+            rows, row = [], []
+            for label, ym in opts:
+                row.append(InlineKeyboardButton(label, callback_data=f"rmo:{ym}"))
+                if len(row) == 3:
+                    rows.append(row); row = []
+            if row:
+                rows.append(row)
+            rows.append(self._cancel_row())
+            await self._wiz_render(update, "📅 <b>Dönüş ayı?</b>", rows)
+            return W_RETM
+        await self._wiz_render(update, "✍️ Dönüş tarihini ya da aralığını yaz:", [self._cancel_row()])
+        return W_RET_CUSTOM
+
+    async def wiz_nights(self, update, ctx) -> int:
+        ctx.user_data["wiz"]["nights"] = int(update.callback_query.data.split(":")[1])
+        await self._wiz_show_price(update, ctx)
+        return W_PRICE
+
+    async def wiz_retm(self, update, ctx) -> int:
+        ym = update.callback_query.data.split(":")[1]
+        s, e = _month_range(ym)
+        ctx.user_data["wiz"]["ret_start"], ctx.user_data["wiz"]["ret_end"] = s, e
+        await self._wiz_show_price(update, ctx)
+        return W_PRICE
+
+    async def wiz_ret_custom(self, update, ctx) -> int:
+        s, e, err = _parse_date_range(update.effective_message.text.strip())
+        if err:
+            await update.effective_message.reply_text(f"❌ {err} Tekrar yaz:")
+            return W_RET_CUSTOM
+        ctx.user_data["wiz"]["ret_start"], ctx.user_data["wiz"]["ret_end"] = s, e
+        await self._wiz_show_price(update, ctx)
+        return W_PRICE
+
+    # --- fiyat ---
+    async def _wiz_show_price(self, update, ctx) -> None:
+        rows, row = [], []
+        for p in WIZ_PRICES:
+            row.append(InlineKeyboardButton(f"{p} TL", callback_data=f"p:{p}"))
+            if len(row) == 2:
+                rows.append(row); row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("✍️ Kendim yaz", callback_data="p:custom")])
+        rows.append(self._cancel_row())
+        await self._wiz_render(update, "💰 <b>Hedef fiyat?</b>\nBu fiyatın altına düşünce haber veririm:", rows)
+
+    async def wiz_price(self, update, ctx) -> int:
+        ctx.user_data["wiz"]["threshold"] = float(update.callback_query.data.split(":")[1])
+        await self._wiz_show_opts(update, ctx)
+        return W_OPTS
+
+    async def wiz_price_custom_ask(self, update, ctx) -> int:
+        await self._wiz_render(update, "✍️ Hedef fiyatı yaz (TL, örn. <code>5500</code>):",
+                               [self._cancel_row()])
+        return W_PRICE_CUSTOM
+
+    async def wiz_price_custom(self, update, ctx) -> int:
+        val = _parse_price(update.effective_message.text.strip())
+        if val is None:
+            await update.effective_message.reply_text("❌ Geçerli bir sayı yaz (örn. 5500):")
+            return W_PRICE_CUSTOM
+        ctx.user_data["wiz"]["threshold"] = val
+        await self._wiz_show_opts(update, ctx)
+        return W_OPTS
+
+    # --- seçenekler + kaydet ---
+    def _wiz_build_route(self, wiz: dict, chat_id: int) -> Route:
+        omap = {tok: codes for tok, _, codes in WIZ_ORIGINS}
+        origins = []
+        for tok in wiz["origins"]:
+            for c in omap.get(tok, [tok]):
+                if c not in origins:
+                    origins.append(c)
+        return Route(
+            None, chat_id, ",".join(origins), ",".join(wiz["dests"]),
+            wiz["dep_start"], wiz["threshold"], "TRY",
+            return_date=wiz.get("ret_start"), date_end=wiz.get("dep_end"),
+            return_date_end=wiz.get("ret_end"), nights=wiz.get("nights", 0),
+            direct_only=wiz.get("direct", False),
+        )
+
+    async def _wiz_show_opts(self, update, ctx) -> None:
+        wiz = ctx.user_data["wiz"]
+        route = self._wiz_build_route(wiz, update.effective_chat.id)
+        dirmark = "Evet ✅" if wiz.get("direct") else "Hayır"
+        rows = [
+            [InlineKeyboardButton(f"🔁 Sadece aktarmasız: {dirmark}", callback_data="opt:direct")],
+            [InlineKeyboardButton("✅ Kaydet", callback_data="opt:save")],
+            self._cancel_row(),
+        ]
+        await self._wiz_render(
+            update,
+            f"📝 <b>Özet</b>\n<b>{route.label()}</b>\nHedef: <b>{route.threshold:.0f} TL</b>\n\n"
+            "Aktarma tercihini seç ve kaydet:",
+            rows,
+        )
+
+    async def wiz_opt_toggle(self, update, ctx) -> int:
+        ctx.user_data["wiz"]["direct"] = not ctx.user_data["wiz"].get("direct", False)
+        await self._wiz_show_opts(update, ctx)
+        return W_OPTS
+
+    async def wiz_save(self, update, ctx) -> int:
+        try:
+            wiz = ctx.user_data.get("wiz", {})
+            route = self._wiz_build_route(wiz, update.effective_chat.id)
+            rid = await self.db.add_route(route)
+            await update.callback_query.answer("Kaydedildi ✅")
+            await update.callback_query.edit_message_text(
+                f"✅ Rota eklendi (#{rid}):\n<b>{route.label()}</b>\n"
+                f"Hedef: <b>{route.threshold:.0f} TL</b>\n\n"
+                "Her 10 dakikada bir tarayıp ucuzlayınca haber vereceğim. "
+                "Rotaların için /rotalar yaz.",
+                parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("wiz_save hatası: %s", exc)
+            if update.callback_query:
+                await update.callback_query.edit_message_text("⚠️ Kaydederken hata oldu, /yeni ile tekrar dene.")
+        ctx.user_data.pop("wiz", None)
+        return ConversationHandler.END
+
+    async def wiz_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        ctx.user_data.pop("wiz", None)
+        msg = "İptal edildi. /menu ile baştan başlayabilirsin."
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(msg)
+        elif update.effective_message:
+            await update.effective_message.reply_text(msg)
+        return ConversationHandler.END
+
+    def _build_wizard(self) -> ConversationHandler:
+        return ConversationHandler(
+            entry_points=[
+                CommandHandler("yeni", self.wiz_start),
+                CallbackQueryHandler(self.wiz_start, pattern="^menu:new$"),
+            ],
+            states={
+                W_ORIGIN: [
+                    CallbackQueryHandler(self.wiz_origin_done, pattern="^o:done$"),
+                    CallbackQueryHandler(self.wiz_origin_toggle, pattern="^o:[A-Z]{3}$"),
+                ],
+                W_DEST: [
+                    CallbackQueryHandler(self.wiz_dest, pattern="^d:(BEG|BALKAN)$"),
+                    CallbackQueryHandler(self.wiz_dest_custom_ask, pattern="^d:custom$"),
+                ],
+                W_DEST_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.wiz_dest_custom)],
+                W_TRIP: [CallbackQueryHandler(self.wiz_trip, pattern="^t:(one|round)$")],
+                W_DEPM: [
+                    CallbackQueryHandler(self.wiz_depm, pattern=r"^dm:\d{4}-\d{2}$"),
+                    CallbackQueryHandler(self.wiz_dep_custom_ask, pattern="^dm:custom$"),
+                ],
+                W_DEP_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.wiz_dep_custom)],
+                W_RETMODE: [CallbackQueryHandler(self.wiz_retmode, pattern="^rm:(nights|month|custom)$")],
+                W_NIGHTS: [CallbackQueryHandler(self.wiz_nights, pattern=r"^n:\d+$")],
+                W_RETM: [CallbackQueryHandler(self.wiz_retm, pattern=r"^rmo:\d{4}-\d{2}$")],
+                W_RET_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.wiz_ret_custom)],
+                W_PRICE: [
+                    CallbackQueryHandler(self.wiz_price, pattern=r"^p:\d+$"),
+                    CallbackQueryHandler(self.wiz_price_custom_ask, pattern="^p:custom$"),
+                ],
+                W_PRICE_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.wiz_price_custom)],
+                W_OPTS: [
+                    CallbackQueryHandler(self.wiz_opt_toggle, pattern="^opt:direct$"),
+                    CallbackQueryHandler(self.wiz_save, pattern="^opt:save$"),
+                ],
+            },
+            fallbacks=[
+                CommandHandler("iptal", self.wiz_cancel),
+                CallbackQueryHandler(self.wiz_cancel, pattern="^wiz:cancel$"),
+            ],
+            per_message=False,
+        )
+
+    # --- ana menü ---
+    async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        rows = [
+            [InlineKeyboardButton("➕ Yeni rota ekle", callback_data="menu:new")],
+            [InlineKeyboardButton("📋 Rotalarım", callback_data="menu:list")],
+            [InlineKeyboardButton("❓ Yardım", callback_data="menu:help")],
+        ]
+        await self._reply(
+            update,
+            "🛫 <b>Ucuz Uçak Bileti Avcısı</b>\n\n"
+            "Aşağıdaki butonlarla kolayca rota ekle — uzun komut yazmana gerek yok.",
+            InlineKeyboardMarkup(rows),
+        )
+
+    async def on_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        await q.answer()
+        action = (q.data or "").split(":")[1]
+        if action == "list":
+            text, markup = await self._render_routes(q.message.chat.id)
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML,
+                                      disable_web_page_preview=True, reply_markup=markup)
+        elif action == "help":
+            await q.edit_message_text(HELP_TEXT, parse_mode=ParseMode.HTML,
+                                      disable_web_page_preview=True)
