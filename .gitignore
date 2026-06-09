@@ -1,0 +1,27 @@
+# Gizli ayarlar
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Veritabanı
+*.db
+*.db-journal
+*.sqlite3
+
+# Loglar
+logs/
+*.log
+
+# Scraper debug dökümleri (ekran görüntüsü + HTML)
+debug/
+
+# Playwright tarayıcıları (genelde ev dizininde ama her ihtimale karşı)
+ms-playwright/
+
+# OS
+.DS_Store

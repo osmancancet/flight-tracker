@@ -1,0 +1,6 @@
+python-telegram-bot[job-queue]==21.6
+playwright==1.47.0
+aiosqlite==0.20.0
+APScheduler==3.10.4
+python-dotenv==1.0.1
+matplotlib==3.9.2
